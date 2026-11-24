@@ -101,8 +101,10 @@
 //!   end-span removal applies only to dimension-3 model curves. UV spans are in
 //!   surface parameter units and must not be removed using a 3D zone tolerance.
 //!   A short UV end span that collapses to a pole (its control points within check
-//!   test #15's tolerance `SM_ZONE_TOL_3D / 10`) is still removed as upstream does
-//!   (#2129). The default retains pinned SMLib behavior.
+//!   test #15's tolerance `SM_ZONE_TOL_3D / 10`) is still removed, and only the pole
+//!   spans are: the rest stays the curve's exact restriction, its knots mapped
+//!   linearly onto the edge's interval (#2129, #21524). The default retains pinned
+//!   SMLib behavior.
 //! - **Rational end spans (WR-575, #1529).** A rational trimmed curve (a conic's NURB)
 //!   keeps its short end spans: upstream's removal stretches the rest of the curve and
 //!   moves it off its conic. A model curve's trim end whose span to an end of the knot
@@ -111,7 +113,7 @@
 //!   side of the end is kept, so both pieces of a split meet at one parameter (#2424).
 //!   On a curve degenerate at the zone tolerance (a circle of radius 1e-6) ends stay
 //!   where they were asked, so its pieces do not overlap. A UV curve's pole end span is
-//!   cleaned as upstream, as its ends are its edge's.
+//!   removed as above, as its ends are its edge's.
 //! - **Back-edges.** `SetIntersectionCurveThroughPoint` starts with
 //!   `IsIntersectorApprox` ([`BSplineCurve::is_intersector_approx`]) and uses
 //!   `SmCurve::ApproximateLength` ([`crate::curve::curve::p2`]), `SmSurface::LocalPointSolve`
@@ -2633,7 +2635,8 @@ impl BSplineCurve {
     /// zone tolerance mapped to parameter space) are removed. With
     /// [`crate::kernel::UpstreamFixes::bspline_trim_preserves_uv_spans`] enabled,
     /// that removal applies only to dimension-3 model curves, preserving UV spans
-    /// exactly, except a short UV end span that collapses to a pole (#2129). A
+    /// exactly, except a short UV end span that collapses to a pole, which alone is
+    /// removed (#2129, #21524). A
     /// rational curve keeps its short end spans, and a model curve's end within a pole
     /// of an interior knot of the knot span holding it snaps to that knot, unless the
     /// curve is degenerate at the zone tolerance (WR-575, #2424). With
@@ -2822,11 +2825,11 @@ impl BSplineCurve {
             );
             // (WR-575) a rational curve's short end span stays, unless it is a pole: a
             // model curve's ends are at the knot then (above), and a UV curve, whose
-            // ends are its edge's, is cleaned as upstream
+            // ends are its edge's, loses its pole spans (below)
             let keeps_rational = keeps_rational && cur1.is_rational() && !pole_end;
             // `fixes.bspline_trim_preserves_uv_spans` (WR-441): a UV curve keeps its
             // short end spans, unless one collapses to a pole that check test #15 would
-            // report (`SM_ZONE_TOL_3D / 10`); that curve is cleaned as upstream (#2129)
+            // report (`SM_ZONE_TOL_3D / 10`); only those spans go (#2129, #21524)
             let cleans_spans =
                 !k.fixes.bspline_trim_preserves_uv_spans || self.dim == 3 || pole_end;
             if cleans_spans
@@ -2834,13 +2837,19 @@ impl BSplineCurve {
                 && ((head < zone_tol_1d_min && knots.len() > 2)
                     || (tail < zone_tol_1d_max && knots.len() > 2))
             {
-                let removal = cur1
-                    .remove_degen_segs(zone_tol_3d)
-                    .map_err(SolidError::nurbs_routine(OP))?;
+                if k.fixes.bspline_trim_preserves_uv_spans && self.dim != 3 {
+                    // a UV curve loses its pole end spans only: upstream's removal would
+                    // also cut every other span shorter than the 3D zone tolerance
+                    cur1 = without_pole_end_spans(&cur1)?;
+                } else {
+                    let removal = cur1
+                        .remove_degen_segs(zone_tol_3d)
+                        .map_err(SolidError::nurbs_routine(OP))?;
 
-                // when segs removed - sCur2 is allocated and set, otherwise it's untouched
-                if let Some(r) = removal {
-                    cur1 = copy_nurb_curve(&r.curve);
+                    // when segs removed - sCur2 is allocated and set, otherwise it's untouched
+                    if let Some(r) = removal {
+                        cur1 = copy_nurb_curve(&r.curve);
+                    }
                 }
             }
 
@@ -2947,6 +2956,52 @@ fn short_end_span_is_pole(cpts: &[CPoint], degree: usize, head: bool, tail: bool
         || (tail
             && n_cpts > degree
             && end_span_is_pole(cpts, n_cpts - 1 - degree, degree, pole_tol))
+}
+
+/// `cur` without the spans at its ends that collapse to poles as check test #15 measures
+/// one ([`end_span_is_pole`] with its tolerance `SM_ZONE_TOL_3D / 10`), never its last
+/// span: the curve's exact restriction ([`crv_trim`]) to the knots that bound the rest,
+/// with its knots mapped linearly back onto the curve's interval (`N_CrvReparam`). Its
+/// image and every other span, however short, stay. A span is judged on the restriction
+/// that would keep it: cutting a pole span off moves the first control point of the next
+/// span, which can make that span a pole too. Each removed span moves that end along the
+/// curve by at most twice the pole tolerance when the weights are positive, as the span
+/// lies in the hull of its control points, all within the pole tolerance of its first.
+/// Not upstream (#2129, #21524).
+fn without_pole_end_spans(cur: &Curve) -> Result<Curve> {
+    // the distinct knots, which bound the spans
+    let mut bounds: Vec<f64> = Vec::new();
+    for &u in cur.knots() {
+        if bounds.last().is_none_or(|&b| u > b) {
+            bounds.push(u);
+        }
+    }
+    let (Some(&start), Some(&end)) = (bounds.first(), bounds.last()) else {
+        return Ok(cur.clone());
+    };
+    // the kept spans run from bounds[lo] to bounds[hi]
+    let (mut lo, mut hi) = (0, bounds.len().saturating_sub(1));
+    let mut kept = cur.clone();
+    loop {
+        let (cpts, degree) = (kept.cpts(), kept.degree());
+        let head = hi.saturating_sub(lo) > 1 && short_end_span_is_pole(cpts, degree, true, false);
+        let tail = hi.saturating_sub(lo) > 1 + usize::from(head)
+            && short_end_span_is_pole(cpts, degree, false, true);
+        if !head && !tail {
+            break;
+        }
+        lo += usize::from(head);
+        hi = hi.saturating_sub(usize::from(tail));
+        let (Some(&a), Some(&b)) = (bounds.get(lo), bounds.get(hi)) else {
+            return Err(invalid(OP_TRIM, "pole end spans outside the knots"));
+        };
+        kept = crv_trim(cur, a, b).map_err(SolidError::nurbs_routine(OP_TRIM))?;
+    }
+    if lo > 0 || hi + 1 < bounds.len() {
+        kept.reparam(start, end)
+            .map_err(SolidError::nurbs_routine(OP_TRIM))?;
+    }
+    Ok(kept)
 }
 
 /// Whether the `degree + 1` control points of the span starting at control point
@@ -3670,6 +3725,153 @@ mod tests {
                     assert_eq!(old.nurb, model.nurb);
                 }
             }
+        }
+    }
+
+    // A quadratic UV curve whose first span [0, 1e-4] is a pole (its three control points
+    // coincide), with interior knots at 0.5 and 0.75; `reversed` gives the same curve run
+    // backwards, its pole span at the end.
+    fn pole_head_uv_curve(reversed: bool) -> BSplineCurve {
+        let mut points = [
+            CPoint::new(0.0, 0.0, 0.0, NOW),
+            CPoint::new(0.0, 0.0, 0.0, NOW),
+            CPoint::new(0.0, 0.0, 0.0, NOW),
+            CPoint::new(0.5, 0.2, 0.0, NOW),
+            CPoint::new(1.0, 0.0, 0.0, NOW),
+            CPoint::new(1.2, 0.3, 0.0, NOW),
+        ];
+        let mut knots = [0.0, 0.0, 0.0, 1e-4, 0.5, 0.75, 1.0, 1.0, 1.0];
+        if reversed {
+            points.reverse();
+            knots.reverse();
+            for u in &mut knots {
+                *u = 1.0 - *u;
+            }
+        }
+        let mut nurb = allocate_nurb_curve(5, 2, 8).unwrap();
+        nurb.cpts_mut().copy_from_slice(&points);
+        nurb.knots_mut().copy_from_slice(&knots);
+        BSplineCurve::from_nurb(nurb, 2, false)
+    }
+
+    #[test]
+    fn uv_trim_with_a_pole_end_keeps_its_short_other_end() {
+        let mut k = Kernel::default();
+        k.fixes.bspline_trim_preserves_uv_spans = true;
+        // The trim keeps the pole span at one end and a span of 1e-6 at the other end,
+        // past an interior knot. The curve's speed there is about 2.2, so that span is
+        // about 2.2e-6 long, below the zone tolerance (1e-5), but it is no pole.
+        for reversed in [false, true] {
+            let original = pole_head_uv_curve(reversed);
+            let (ivl, kept) = if reversed {
+                (
+                    Extent1d::from_min_max(0.25 - 1e-6, 1.0),
+                    (0.25 - 1e-6, 1.0 - 1e-4),
+                )
+            } else {
+                (
+                    Extent1d::from_min_max(0.0, 0.75 + 1e-6),
+                    (1e-4, 0.75 + 1e-6),
+                )
+            };
+            let mut trimmed = original.clone();
+            let mut trimmed_ivl = ivl;
+            trimmed
+                .trim(&k, &mut trimmed_ivl, TrimMode::Notify)
+                .unwrap();
+            assert_eq!(trimmed_ivl, ivl, "reversed {reversed}");
+            assert_eq!(trimmed.natural_interval(), ivl, "reversed {reversed}");
+
+            // Only the pole span goes: the rest is the exact restriction of the curve,
+            // its control points unchanged and its knots mapped linearly onto the
+            // edge's interval, so its image is the restriction's (an identity).
+            let restriction = crv_trim(original.nurb.as_ref().unwrap(), kept.0, kept.1).unwrap();
+            let nurb = trimmed.nurb.as_ref().unwrap();
+            assert_eq!(nurb.cpts(), restriction.cpts(), "reversed {reversed}");
+            assert_eq!(nurb.knots().len(), restriction.knots().len());
+            let scale = (ivl.max() - ivl.min()) / (kept.1 - kept.0);
+            for (&u, &r) in nurb.knots().iter().zip(restriction.knots()) {
+                let expected = ivl.min() + scale * (r - kept.0);
+                assert!(
+                    (u - expected).abs() <= 4.0 * f64::EPSILON,
+                    "reversed {reversed}: knot {u} vs {expected}"
+                );
+            }
+            // the short non-pole span keeps its knot
+            assert_eq!(
+                trimmed.knots(None).unwrap().0.len(),
+                4,
+                "reversed {reversed}"
+            );
+            // the ends stay on the curve's ends (the pole is one point)
+            for t in [ivl.min(), ivl.max()] {
+                let gap = trimmed.evaluate_point(t).unwrap() - original.evaluate_point(t).unwrap();
+                assert!(gap.length() <= 4.0 * f64::EPSILON, "reversed {reversed}");
+            }
+            // and check test #15 finds no pole
+            assert!(!trimmed.has_internal_pole(&k, ZONE_TOL_3D / 10.0).unwrap());
+        }
+    }
+
+    // A quadratic UV curve with the knots `knots` and the control points `xs` on the u
+    // axis.
+    fn uv_curve_on_u_axis(knots: &[f64], xs: &[f64]) -> BSplineCurve {
+        let mut nurb = allocate_nurb_curve(xs.len() - 1, 2, knots.len() - 1).unwrap();
+        for (cpt, &x) in nurb.cpts_mut().iter_mut().zip(xs) {
+            *cpt = CPoint::new(x, 0.0, 0.0, NOW);
+        }
+        nurb.knots_mut().copy_from_slice(knots);
+        BSplineCurve::from_nurb(nurb, 2, false)
+    }
+
+    #[test]
+    fn uv_trim_removes_the_whole_run_of_pole_spans_at_an_end() {
+        let mut k = Kernel::default();
+        k.fixes.bspline_trim_preserves_uv_spans = true;
+        let pole_tol = ZONE_TOL_3D / 10.0;
+        // (curve, where the first span that is no pole starts); the trim's end at 0.9
+        // moves only the last two control points. In the first curve
+        // the second span is no pole on the curve's control points, but cutting the
+        // first span off moves its first control point to C(1e-4) = (0.4e-6, 0), and
+        // then it is one. In the second the second span is a pole longer than the
+        // zone tolerance mapped to the parameter (1e-5 / 0.18 at the start).
+        let cases = [
+            (
+                uv_curve_on_u_axis(
+                    &[0.0, 0.0, 0.0, 1e-4, 2e-4, 0.5, 1.0, 1.0, 1.0],
+                    &[0.0, 0.0, 0.8e-6, 1.1e-6, 0.5, 1.0],
+                ),
+                2e-4,
+            ),
+            (
+                uv_curve_on_u_axis(
+                    &[0.0, 0.0, 0.0, 1e-5, 1e-2, 0.5, 1.0, 1.0, 1.0],
+                    &[0.0, 0.9e-6, 0.0, 0.9e-6, 0.5, 1.0],
+                ),
+                1e-2,
+            ),
+        ];
+        for (at, (original, kept)) in cases.into_iter().enumerate() {
+            let ivl = Extent1d::from_min_max(0.0, 0.9);
+            let mut trimmed = original.clone();
+            let mut trimmed_ivl = ivl;
+            trimmed
+                .trim(&k, &mut trimmed_ivl, TrimMode::Notify)
+                .unwrap();
+            assert_eq!(trimmed_ivl, ivl, "case {at}");
+            assert_eq!(trimmed.natural_interval(), ivl, "case {at}");
+            // two spans are left, the restriction to [kept, 0.9]
+            assert_eq!(trimmed.knots(None).unwrap().0.len(), 3, "case {at}");
+            let restriction = crv_trim(original.nurb.as_ref().unwrap(), kept, 0.9).unwrap();
+            assert_eq!(
+                trimmed.nurb.as_ref().unwrap().cpts(),
+                restriction.cpts(),
+                "case {at}"
+            );
+            assert!(
+                !trimmed.has_internal_pole(&k, pole_tol).unwrap(),
+                "case {at}"
+            );
         }
     }
 
